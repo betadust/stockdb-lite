@@ -37,6 +37,14 @@ namespace high_frequency_storage{
         auto operator<=>(const PricePoint& other) const = default;
 
 
+        // --- get & set ---
+		int64_t getTimestamp() const { return timestamp_; }
+		double getPrice() const { return price_; }
+		void setTimestamp(int64_t ts) { timestamp_ = ts; }
+		void setPrice(double p) { price_ = p; }
+
+
+
         // --- 工具成员函数 ---
 
         // 将时间戳转换为可读的日期时间字符串

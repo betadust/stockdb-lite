@@ -14,6 +14,8 @@
 
 #ifdef _WIN32
 #include <windows.h>  // 其实不需要，localtime_s 在 <ctime> 中
+#undef min
+#undef max // 避免 windows.h 定义的 min/max 宏干扰 std::min/std::max
 #endif
 
 namespace high_frequency_storage {
