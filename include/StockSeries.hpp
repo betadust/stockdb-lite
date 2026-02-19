@@ -1,7 +1,7 @@
 /**
  * @file include/StockSeries.hpp
  * @author @betadust
- * @date [2026-02-15]
+ * @date [2026-02-19]
  */
 
 #pragma once
@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <memory>
+#include <shared_mutex>
 
 namespace high_frequency_storage {
 
@@ -32,8 +33,10 @@ namespace high_frequency_storage {
         // ---------- 核心数据成员 ----------
 
         std::string stock_code_;              // 股票代码（如 "AAPL"）
-        std::vector<PricePoint> metadata_;        // 原始数据点（阶段一）
-        bool time_sorted_;                       // 数据是否已排序（用于优化）
+        std::vector<PricePoint> metadata_;    // 原始数据点（阶段一）
+                      
+        mutable std::shared_mutex mutex_;    // 互斥锁
+        mutable bool time_sorted_;    // 数据是否已排序（用于优化）
 
         // ---------- 统计信息（缓存加速）----------
 
@@ -43,6 +46,8 @@ namespace high_frequency_storage {
         mutable int64_t min_timestamp_;         // 最早时间戳（缓存）
         mutable int64_t max_timestamp_;         // 最晚时间戳（缓存）
 
+
+        
         // ---------- 阶段二扩展（压缩支持）----------
 
         // 这些成员将在阶段二实现时启用
@@ -74,6 +79,11 @@ namespace high_frequency_storage {
 
         // ---------- 核心数据接口 ----------
 
+        // --添加数据时，由调用者保证写锁占用！
+		// --查询数据时，由调用者保证读锁占用！
+		// --查询数据时，由被调用者写锁占用（如果需要排序或更新统计信息）！
+
+
         /**
          * @brief 添加一个价格数据点
          * @param timestamp 时间戳
@@ -100,6 +110,8 @@ namespace high_frequency_storage {
          *
          * 如果 start_time > end_time，返回空列表。
          * 时间复杂度：阶段一为 O(n)，后续优化为 O(log n)
+         * 
+         * 
          */
         std::vector<double> queryRange(int64_t start_time, int64_t end_time) const;
 
@@ -134,8 +146,9 @@ namespace high_frequency_storage {
 
         // @brief 获取股票代码        
         const std::string& stockCode() const { return stock_code_; }
+		// @brief 获取所有数据点（只读）
+		const std::vector<PricePoint>& getMetadata() const { return metadata_; }
 
-        
         // @brief 获取数据点数量
         size_t size() const { return metadata_.size(); }
 

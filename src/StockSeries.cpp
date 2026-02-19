@@ -1,7 +1,7 @@
 /** 
  * @file src/StockSeries.cpp
  * @author @betadust
- * @date [2026-02-15]
+ * @date [2026-02-19]
 */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 
 namespace high_frequency_storage {
 
@@ -39,7 +40,6 @@ namespace high_frequency_storage {
 		if (time_sorted_ && !metadata_.empty() && timestamp < metadata_.back().getTimestamp()) {
 			time_sorted_ = false;
 		}
-
 		metadata_.emplace_back(timestamp, price);
 		// 标记统计信息为脏
 		stats_dirty_ = true; // 统计信息需要更新
@@ -82,7 +82,6 @@ namespace high_frequency_storage {
 		// ensureSorted(); error! const方法不能调用非const方法，
 		// 解决方案是将ensureSorted()声明为mutable，或者在queryRange中使用const_cast调用ensureSorted()。
 		const_cast<StockSeries*>(this)->ensureSorted(); 
-
 		std::vector<double> result;
 		
 		//调用私有二分查找工具
@@ -118,6 +117,7 @@ namespace high_frequency_storage {
 
 	// @brief 确保数据按时间戳排序
 	void StockSeries::ensureSorted(){
+		std::unique_lock lock(mutex_);  // 注意：这里需要写锁，因为可能修改 timme_sorted_
 		if (!time_sorted_ && metadata_.size() > 1) {
 			std::sort(metadata_.begin(), metadata_.end(),
 				[](const PricePoint& a, const PricePoint& b) {
@@ -218,7 +218,7 @@ namespace high_frequency_storage {
 			std::string code = line.substr(0, pos1);
 			// 检查是否匹配当前对象的股票代码		
 			if (code != stock_code_) continue;
-			
+
 			int64_t timestamp = std::stoll(line.substr(pos1 + 1, pos2 - pos1 - 1));
 			double price = std::stod(line.substr(pos2 + 1));
 
@@ -231,7 +231,6 @@ namespace high_frequency_storage {
 				continue;
 			}
 		}
-
 		return count;
 	}
 
@@ -313,3 +312,4 @@ namespace high_frequency_storage {
 	}
 
 } // namespace high_frequency_storage
+

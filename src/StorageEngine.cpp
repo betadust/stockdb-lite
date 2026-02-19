@@ -4,7 +4,7 @@
  * @brief 存储引擎实现
  * 
  * @author beta dust
- * @date [2026-02-17]
+ * @date [2026-02-19]
 */
 
 // File: StorageEngine.cpp
@@ -44,51 +44,6 @@ namespace high_frequency_storage {
 	
 	// ---------- 数据导入接口 ----------
 
-	// @brief 从 CSV 文件加载数据
-	size_t StorageEngine::loadFromCSV(const std::string& filename, bool has_header) {
-		std::ifstream file(filename);
-		if (!file.is_open()) {
-			throw std::runtime_error("Cannot open file: " + filename);
-		}
-		auto it = begin(filename);
-		auto ed = end();
-
-		size_t count = 0;
-		bool is_first_row = true;
-
-		for (; it != ed; ++it) {
-			auto row = *it;
-			// 跳过表头
-			if (is_first_row) {
-				is_first_row = false;
-				if (row.size() >= 1 && (row[0] == "stock_code" || row[0] == "code")) {
-					continue;
-				}
-			}
-			// 处理数据行...
-			if (row.size() < 3) continue; // 不完整行，跳过
-			try {
-				std::string stock_code = row[0];
-				// 解析时间戳
-				int64_t timestamp;
-				if (row[1].find('-') != std::string::npos) {
-					timestamp = utils::TimeUtils::fromString(row[1]);
-				}
-				else {
-					timestamp = std::stoll(row[1]);
-				}
-				double price = std::stod(row[2]);
-				addPoint(stock_code, timestamp, price);
-			}
-			catch (const std::exception& e) {
-				// 记录错误但继续处理
-				std::cerr << "Error parsing row: " << e.what() << " - Skipping row." << std::endl;
-				continue;
-			}
-			count++;
-		}
-		return count;
-	}
 	// @brief 从 CSV 字符串加载数据
 	size_t StorageEngine::loadFromCSVString(const std::string& csv_data) {
 		std::unique_lock lock(rw_mutex_);
@@ -118,8 +73,9 @@ namespace high_frequency_storage {
 				else {
 					timestamp = std::stoll(row[1]);
 				}
+				//std::cout << "Load From CSVString : " << timestamp << "\n";
 				double price = std::stod(row[2]);
-				addPoint(stock_code, timestamp, price);
+				addPointImpl(stock_code, timestamp, price);
 				count++;
 			}
 			catch (const std::exception& e) {
@@ -130,11 +86,183 @@ namespace high_frequency_storage {
 		}
 		return count;
 	}
-	
+
+	// @brief 从 CSV 文件加载数据
+	size_t StorageEngine::loadFromCSV(const std::string& filename) {
+		std::ifstream file(filename);
+		if (!file.is_open()) {
+			throw std::runtime_error("Cannot open file: " + filename);
+		}
+		// 读取整个文件到字符串
+		std::stringstream buffer;
+		buffer << file.rdbuf();
+		// 调用 loadFromCSVString 完成实际解析
+		return loadFromCSVString(buffer.str());
+	}
+
+	// @brief 从大CSV文件加载数据（流式处理）
+	size_t StorageEngine::loadLargeCSV(const std::string& filename) {
+		std::unique_lock lock(rw_mutex_);
+		if (!is_initialized_) {
+			initialize(config_.reserve_size);
+		}
+		// 打开文件
+		std::ifstream file(filename);
+		if (!file.is_open()) {
+			throw std::runtime_error("Cannot open file: " + filename);
+		}
+		// 获取文件大小（用于进度报告）
+		file.seekg(0, std::ios::end);
+		std::streampos file_size = file.tellg();
+		file.seekg(0, std::ios::beg);
+		file.close(); // 关闭后由 CSVParser::Iterator 重新打开
+		// 使用 CSVParser 的迭代器逐行处理
+		auto it = begin(filename);
+		auto end_it = end();
+
+		size_t count = 0;
+		size_t line_number = 0;
+		size_t error_count = 0;
+		size_t report_interval = 100000;  // 每10万行报告一次
+		// 简单判断表头
+		if (it != end_it) {
+			auto row = *it;
+			// 若表头则跳过
+			if (row.size() >= 1 && (row[0] == "stock_code" || row[0] == "code")) {
+				++it;
+				line_number++;
+			}
+		}
+		// 记录开始时间
+		auto start_time = std::chrono::steady_clock::now();
+		auto last_report = start_time;
+		for (; it != end_it; ++it, ++line_number) {
+			const auto& row = *it;
+			if (row.size() < 3) {
+				error_count++;
+				continue;
+			}
+			try {
+				std::string stock_code = row[0];
+				// 解析时间戳
+				int64_t timestamp;
+				if (row[1].find('-') != std::string::npos) {
+					timestamp = utils::TimeUtils::fromString(row[1]);
+					if (timestamp == -1) {
+						error_count++;
+						continue;
+					}
+				}
+				else {
+					timestamp = std::stoll(row[1]);
+				}
+				double price = std::stod(row[2]);
+				// 验证数据
+				if (!isValidPoint(stock_code, timestamp, price)) {
+					error_count++;
+					continue;
+				}
+				// 添加到批处理缓存
+				// 批量缓存，可减少频繁的 addPoint 调用
+				
+				batch_cache_.add(stock_code, timestamp, price);
+				count++;
+				if (batch_cache_.needsFlush()) {
+					batch_cache_.flushBatchCache(this);
+				}
+				// 定期报告进度
+				if (line_number % report_interval == 0) {
+					auto now = std::chrono::steady_clock::now();
+					auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_report);
+					if (elapsed.count() >= 5) {  // 至少5秒报告一次
+						reportProgress(filename, line_number, count, error_count,
+							file_size, file.tellg(), start_time);
+						last_report = now;
+					}
+				}
+			}
+			catch (const std::exception& e) {
+				error_count++;
+				continue;
+			}
+		}
+		// 刷新剩余的批处理缓存
+		batch_cache_.flushBatchCache(this);
+		// 最终报告
+		auto end_time = std::chrono::steady_clock::now();
+		auto total_seconds = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+		std::cout << "\n=== 大文件加载完成 ===\n"
+			<< "文件: " << filename << "\n"
+			<< "总行数: " << line_number << "\n"
+			<< "成功加载: " << count << " 点\n"
+			<< "错误行数: " << error_count << "\n"
+			<< "耗时: " << total_seconds.count() << " 秒\n"
+			<< "速度: " << (count / std::max(1.0, double(total_seconds.count()))) << " 点/秒\n";
+		return count;
+	}
+
+	// @brief 刷新批处理缓存
+	void StorageEngine::BatchCache::flushBatchCache(StorageEngine* engine) {
+		for (auto& [code, points] : cache_map_) {
+			if (points.empty()) continue;
+			auto it = engine->series_map_.find(code);
+			if (it == engine->series_map_.end()) {
+				auto series = std::make_unique<StockSeries>(code);
+				series->reserve(engine->config_.reserve_size);
+				it = engine->series_map_.emplace(code, std::move(series)).first;
+			}
+			// 批量添加
+			it->second->addPrices(points);
+			engine->total_points_ += points.size();
+			points.clear();  // 清空以便复用
+		}
+		clear(); //	清空缓存
+	}
+
+	// 报告进度
+	void StorageEngine::reportProgress(const std::string& filename,
+		size_t line_number,
+		size_t points_loaded,
+		size_t error_count,
+		std::streampos file_size,
+		std::streampos current_pos,
+		const std::chrono::steady_clock::time_point& start_time) {
+		double progress = (file_size > 0) ?
+			(double(current_pos) / double(file_size) * 100.0) : 0.0;
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
+		double speed = (elapsed.count() > 0) ?
+			(double(line_number) / elapsed.count()) : 0.0;
+		// 估算剩余时间
+		double remaining_seconds = (speed > 0 && progress < 99.0) ?
+			(double(file_size - current_pos) / (speed * 1000)) : 0.0;
+		int remaining_hours = int(remaining_seconds) / 3600;
+		int remaining_minutes = (int(remaining_seconds) % 3600) / 60;
+		int remaining_secs = int(remaining_seconds) % 60;
+		std::cout << "\r进度: " << std::fixed << std::setprecision(1) << progress << "%"
+			<< " | 行数: " << line_number
+			<< " | 加载: " << points_loaded
+			<< " | 错误: " << error_count
+			<< " | 速度: " << int(speed) << " 行/秒"
+			<< " | 剩余: ";
+		if (remaining_hours > 0) {
+			std::cout << remaining_hours << "h ";
+		}
+		if (remaining_minutes > 0 || remaining_hours > 0) {
+			std::cout << remaining_minutes << "m ";
+		}
+		std::cout << remaining_secs << "s    " << std::flush;
+	}
 
 	// @brief 批量添加数据点
 	void StorageEngine::addPoints(const std::string& stock_code, const std::vector<PricePoint>& points) {
-		std::shared_lock lock(rw_mutex_);
+		std::unique_lock lock(rw_mutex_);
+		addPointsImpl(stock_code, points);
+	}
+	void StorageEngine::addPointsImpl(const std::string& stock_code, const std::vector<PricePoint>& points) {
+		if (!isValidPoints(stock_code, points)) {
+			throw std::invalid_argument("Invalid stock code or points");
+		}
 		if (!is_initialized_) {
 			initialize(config_.reserve_size);
 		}
@@ -154,7 +282,13 @@ namespace high_frequency_storage {
 	
 	// @brief 添加单个数据点 
 	void StorageEngine::addPoint(const std::string& stock_code, int64_t timestamp, double price) {
-		std::shared_lock lock(rw_mutex_);
+		std::unique_lock lock(rw_mutex_);
+		addPointImpl(stock_code, timestamp, price);
+	}
+	void StorageEngine::addPointImpl(const std::string& stock_code, int64_t timestamp, double price) {
+		if (!isValidPoint(stock_code, timestamp, price)) {
+			throw std::invalid_argument("Invalid stock code, timestamp, or price");
+		}
 		if (!is_initialized_) {
 			initialize(config_.reserve_size);
 		}
@@ -333,65 +467,45 @@ namespace high_frequency_storage {
 
 	// ---------- 序列化接口 ----------
 
-	/*
+	// @brief 将所有数据导出为 CSV 格式字符串
 	std::string StorageEngine::toCSV() const {
 		std::shared_lock lock(rw_mutex_);
-
 		std::ostringstream oss;
 		oss << std::fixed << std::setprecision(2);
-
 		// 写入表头
 		oss << "stock_code,timestamp,price\n";
-
 		// 写入所有数据
 		for (const auto& [code, series] : series_map_) {
-			// 需要 StockSeries 提供导出接口
-			// oss << series->toCSV();
-			// 暂时简化
+			// 获取该股票的 CSV 数据（不包含表头）
+			std::string series_csv = series->toCSV();
+			// 直接追加到输出流
+			oss << series_csv;
 		}
-
 		return oss.str();
 	}
 
+	// @brief 将指定股票的数据导出为 CSV 格式字符串
 	std::string StorageEngine::toCSV(const std::string& stock_code) const {
 		std::shared_lock lock(rw_mutex_);
-
 		auto it = series_map_.find(stock_code);
 		if (it == series_map_.end()) {
 			return "";
 		}
-
 		return it->second->toCSV();
 	}
 
+	// @brief 将数据保存到 CSV 文件
 	bool StorageEngine::saveToFile(const std::string& filename) const {
 		std::shared_lock lock(rw_mutex_);
-
 		std::ofstream file(filename, std::ios::binary);
 		if (!file.is_open()) {
 			return false;
 		}
-
 		// 简单实现：保存为 CSV
 		std::string csv = toCSV();
 		file.write(csv.c_str(), csv.size());
-
 		return file.good();
 	}
-
-	bool StorageEngine::loadFromFile(const std::string& filename) {
-		std::ifstream file(filename);
-		if (!file.is_open()) {
-			return false;
-		}
-
-		std::stringstream buffer;
-		buffer << file.rdbuf();
-
-		loadFromCSVString(buffer.str());
-		return true;
-	}
-	*/
 
 	// ---------- 调试接口 ----------
 
@@ -427,27 +541,21 @@ namespace high_frequency_storage {
 
 	void StorageEngine::printHead(const std::string& stock_code, size_t n) const {
 		std::shared_lock lock(rw_mutex_);
-
 		auto it = series_map_.find(stock_code);
 		if (it == series_map_.end()) {
 			std::cout << "股票 " << stock_code << " 不存在\n";
 			return;
 		}
-
 		it->second->printHead(n);
 	}
-
 	size_t StorageEngine::memoryUsage() const {
 		std::shared_lock lock(rw_mutex_);
-
 		size_t total = sizeof(*this);
 		total += series_map_.bucket_count() * sizeof(void*);
-
 		for (const auto& [code, series] : series_map_) {
 			total += code.capacity();
 			total += series->memoryUsage();
 		}
-
 		return total;
 	}
 

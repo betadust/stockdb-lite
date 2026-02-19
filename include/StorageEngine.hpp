@@ -5,7 +5,7 @@
  * StorageEngine 管理所有股票的时间序列数据，提供数据导入、查询、统计等功能。
  * 
  * @author beta dust
- * @date [2026-02-17]
+ * @date [2026-02-19]
 */  
 #pragma once
 
@@ -31,12 +31,12 @@ namespace high_frequency_storage {
     private:
         // ---------- 核心数据结构 ----------
 
+        std::string name_;                    // 引擎名称
         // 股票代码 -> 股票时间序列
         std::unordered_map<std::string, std::unique_ptr<StockSeries>> series_map_;
-
-        // ---------- 元数据 ----------
-
-        std::string name_;                    // 引擎名称
+        static constexpr size_t BATCH_SIZE = 10000;        // 每只股票的缓存批大小
+        static constexpr size_t CACHE_THRESHOLD = 100000;  // 总缓存阈值
+        
         size_t total_points_ = 0;              // 总数据点数
         std::atomic<bool> is_initialized_{ false };  // 是否已初始化
 
@@ -51,6 +51,35 @@ namespace high_frequency_storage {
             size_t reserve_size = 10000;        // 每只股票预分配大小
             bool enable_stats = true;            // 是否启用统计
         } config_;
+
+        // ---------- 缓存 ----------
+        struct BatchCache {
+            // 缓存批量添加的数据，减少频繁调用 addPoint 的开销
+            std::unordered_map<std::string, std::vector<PricePoint>> cache_map_;
+            size_t cached_points_ = 0;  // 跟踪缓存中的总点数
+
+            void add(const std::string& code, const size_t timestamp,const double price) {
+                if (code.empty()) {
+					throw std::invalid_argument("Stock code cannot be empty");
+                }
+                auto& vec = cache_map_[code];
+                if(vec.empty()) vec.reserve(BATCH_SIZE);
+                vec.emplace_back(timestamp, price);
+                cached_points_++;
+            }
+
+            bool needsFlush() const {
+                return cached_points_ >= CACHE_THRESHOLD;
+            }
+
+            void clear() {
+                cache_map_.clear();
+                cached_points_ = 0;
+            }
+            // 刷新批处理缓存
+            void flushBatchCache(StorageEngine* engine);
+        };
+        BatchCache batch_cache_;
 
     public:
         // ---------- 构造函数/析构函数 ----------
@@ -100,27 +129,26 @@ namespace high_frequency_storage {
         // ---------- 数据导入接口 ----------
 
         /**
-         * @brief 从 CSV 文件加载数据
-         * @param filename CSV 文件路径
-         * @param has_header 是否包含表头
+         * @brief 从 CSV 字符串加载数据
+         * @param csv_data CSV 格式的字符串
          * @return 成功加载的数据点数
-         *
          * CSV 格式要求：
          * - 列顺序：stock_code, timestamp, price
          * - 时间戳格式：Unix 毫秒时间戳 或 "YYYY-MM-DD HH:MM:SS.mmm"
          * - 价格格式：浮点数
          */
-
-        size_t loadFromCSV(const std::string& filename, bool has_header = true);
-
+        size_t loadFromCSVString(const std::string& csv_data);
+                
         /**
-         * @brief 从 CSV 字符串加载数据
-         * @param csv_data CSV 格式的字符串
+         * @brief 从 CSV 文件加载数据，调用loadFromCSVString
+         * @param filename CSV 
          * @return 成功加载的数据点数
          */
-        
-        size_t loadFromCSVString(const std::string& csv_data);
+        size_t loadFromCSV(const std::string& filename);
 
+        // ... 流式处理，不调用 loadFromCSVString
+        size_t loadLargeCSV(const std::string& filename);
+       
         /**
          * @brief 批量添加数据点
          * @param stock_code 股票代码
@@ -137,6 +165,8 @@ namespace high_frequency_storage {
          */
         void addPoint(const std::string& stock_code,
             int64_t timestamp, double price);
+
+
 
         // ---------- 查询接口 ----------
 
@@ -180,20 +210,14 @@ namespace high_frequency_storage {
         std::vector<int64_t> getAllTimestamps(const std::string& stock_code) const;
 
         // ---------- 统计信息接口 ----------
-
-        /**
-         * @brief 获取所有股票代码
-         */
+        
+        // @brief 获取所有股票代码       
         std::vector<std::string> getAllStockCodes() const;
-
-        /**
-         * @brief 获取股票数量
-         */
+       
+        // @brief 获取股票数量 
         size_t stockCount() const { return series_map_.size(); }
-
-        /**
-         * @brief 获取总数据点数
-         */
+      
+        // @brief 获取总数据点数 
         size_t totalPoints() const { return total_points_; }
 
         /**
@@ -203,36 +227,25 @@ namespace high_frequency_storage {
          */
         size_t pointCount(const std::string& stock_code) const;
 
-        /**
-         * @brief 获取指定股票的最早时间戳
-         */
+        
+        // @brief 获取指定股票的最早时间戳
         int64_t minTimestamp(const std::string& stock_code) const;
-
-        /**
-         * @brief 获取指定股票的最晚时间戳
-         */
+      
+        // @brief 获取指定股票的最晚时间戳
         int64_t maxTimestamp(const std::string& stock_code) const;
 
-        /**
-         * @brief 获取指定股票的最低价
-         */
+        // @brief 获取指定股票的最低价
         double minPrice(const std::string& stock_code) const;
-
-        /**
-         * @brief 获取指定股票的最高价
-         */
+        
+        // @brief 获取指定股票的最高价   
         double maxPrice(const std::string& stock_code) const;
 
-        /**
-         * @brief 检查股票是否存在
-         */
+        // @brief 检查股票是否存在      
         bool hasStock(const std::string& stock_code) const;
 
         // ---------- 数据维护接口 ----------
-
-        /**
-         * @brief 清空所有数据
-         */
+        
+        // @brief 清空所有数据
         void clear();
 
         /**
@@ -241,53 +254,25 @@ namespace high_frequency_storage {
          * @return 是否成功移除
          */
         bool removeStock(const std::string& stock_code);
-
-        /**
-         * @brief 对指定股票进行压缩优化
-         * @param stock_code 股票代码
-         */
         
+        // @brief 对指定股票进行压缩优化    
         //void compress(const std::string& stock_code);
-
-        /**
-         * @brief 对所有股票进行压缩优化
-         */
-        
-         //void compressAll();
+              
+        // @brief 对所有股票进行压缩优化
+        //void compressAll();
 
         // ---------- 序列化接口 ----------
 
-        /**
-         * @brief 导出所有数据到 CSV 字符串
-         */
-        
-        //std::string toCSV() const;
-
-        /**
-         * @brief 导出指定股票到 CSV 字符串
-         */
-        
-        //std::string toCSV(const std::string& stock_code) const;
-
-        /**
-         * @brief 保存到文件
-         * @param filename 文件名
-         */
-        
-        //bool saveToFile(const std::string& filename) const;
-
-        /**
-         * @brief 从文件加载
-         * @param filename 文件名
-         */
-        
-        //bool loadFromFile(const std::string& filename);
+        // @brief 导出所有数据到 CSV 字符串         
+        std::string toCSV() const;
+        // @brief 导出指定股票到 CSV 字符串
+        std::string toCSV(const std::string& stock_code) const;
+        // @brief 保存到文件
+        bool saveToFile(const std::string& filename) const;
 
         // ---------- 调试接口 ----------
-
-        /**
-         * @brief 打印引擎状态
-         */
+        // 
+        // @brief 打印引擎状态 
         void printStatus() const;
 
         /**
@@ -297,15 +282,51 @@ namespace high_frequency_storage {
          */
         void printHead(const std::string& stock_code, size_t n = 5) const;
 
-        /**
-         * @brief 获取内存占用估算值（字节）
-         */
+        // @brief 获取内存占用估算值（字节） 
         size_t memoryUsage() const;
 
-        /**
-         * @brief 获取引擎名称
-         */
+        // @brief 获取引擎名称
         const std::string& name() const { return name_; }
+
+    private:
+		// ---------- 内部辅助函数 ----------
+
+		// @brief 解析 判断是否为表头行;
+		// 若后续需要则添加该函数的实现
+        //bool isHeaderRow(const std::vector<std::string>& row) const;
+
+        // @brief 报告加载进度
+        void reportProgress(const std::string& filename,
+            size_t line_number,
+            size_t points_loaded,
+            size_t error_count,
+            std::streampos file_size,
+            std::streampos current_pos,
+            const std::chrono::steady_clock::time_point& start_time);
+
+
+        bool isValidPoints(const std::string& stock_code,
+            const std::vector<PricePoint>& points) const {
+            if (stock_code.empty()) return false;
+            for (const auto& point : points) {
+                if (point.getTimestamp() <= 0 || point.getPrice() <= 0.0) {
+                    return false;
+                }
+            }
+            return true;
+		}
+
+        bool isValidPoint(const std::string& stock_code,
+            int64_t timestamp, double price) const {
+            return (!stock_code.empty()) && timestamp > 0 && price > 0.0;
+        }
+		// ---------- 无锁函数 ----------
+
+        void addPointsImpl(const std::string& stock_code,
+            const std::vector<PricePoint>& points); 
+
+        void addPointImpl(const std::string& stock_code,
+			int64_t timestamp, double price);
     };
 
 } // namespace high_frequency_storage
