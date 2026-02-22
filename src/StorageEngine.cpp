@@ -443,28 +443,6 @@ namespace high_frequency_storage {
 		return true;
 	}
 
-	// @brief 压缩指定股票的数据（阶段二预留接口）
-	/*
-	void StorageEngine::compress(const std::string& stock_code) {
-		std::unique_lock lock(rw_mutex_);
-		auto it = series_map_.find(stock_code);
-		if (it != series_map_.end()) {
-			// 后续实现压缩
-			// it->second->compress();
-		}
-	}
-
-	// @brief 压缩所有股票的数据（阶段二预留接口）
-	void StorageEngine::compressAll() {
-		std::unique_lock lock(rw_mutex_);
-
-		for (auto& [_, series] : series_map_) {
-			// 后续实现压缩
-			// series->compress();
-		}
-	}
-	*/
-
 	// ---------- 序列化接口 ----------
 
 	// @brief 将所有数据导出为 CSV 格式字符串

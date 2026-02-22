@@ -1,12 +1,13 @@
 /**
  * @file include/StockSeries.hpp
  * @author @betadust
- * @date [2026-02-19]
+ * @date [2026-02-21]
  */
 
 #pragma once
 
 #include "PricePoint.hpp"
+#include "Compressor.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -24,36 +25,52 @@ namespace high_frequency_storage {
      * 它提供了数据的添加、范围查询、统计信息获取等核心功能。
      *
      * 设计演进路线：
-     * - 阶段一：基于 std::vector 的基础实现
-     * - 阶段二：添加差分压缩支持
-     * - 阶段三：集成内存池优化
+     * - 阶段一：基于 std::vector 的基础实现 √
+     * - 阶段二：添加差分压缩支持            now
+     * - 阶段三：集成内存池优化              ×
      */
+    
+    
+    /**
+     * @brief 压缩段信息
+     */
+    struct CompressedSegment {
+        CompressedBlock block;              // 压缩块元信息
+        std::vector<uint8_t> data;          // 压缩后的数据
+        int64_t min_timestamp;               // 段内最小时间戳
+        int64_t max_timestamp;               // 段内最大时间戳
+        size_t memoryUsage() const {
+            return sizeof(*this) + data.capacity() + block.timestamp_bytes + block.price_bytes;
+        }
+    };
+
     class StockSeries {
     private:
         // ---------- 核心数据成员 ----------
-
+        
         std::string stock_code_;              // 股票代码（如 "AAPL"）
-        std::vector<PricePoint> metadata_;    // 原始数据点（阶段一）
-                      
-        mutable std::shared_mutex mutex_;    // 互斥锁
-        mutable bool time_sorted_;    // 数据是否已排序（用于优化）
+        
+        // 未压缩元数据设计
+        //std::vector<PricePoint> metadata_;    // 原始数据点（阶段一）timestamp始终有序
 
-        // ---------- 统计信息（缓存加速）----------
-
-        mutable bool stats_dirty_;              // 统计信息是否需要重新计算
+        // 双缓冲区设计
+        std::vector<PricePoint> active_buffer_;           // 活跃缓冲区（未压缩）
+        std::vector<CompressedSegment> compressed_segments_; // 压缩段列表
+                     
+        // 统计信息缓存
         mutable double min_price_;              // 最低价格（缓存）
         mutable double max_price_;              // 最高价格（缓存）
         mutable int64_t min_timestamp_;         // 最早时间戳（缓存）
         mutable int64_t max_timestamp_;         // 最晚时间戳（缓存）
+		size_t total_points_;                      // 数据点总数（包括压缩和未压缩）
 
+        // 缓冲区配置
+        static constexpr size_t ACTIVE_BUFFER_LIMIT = 10000;  // 1万点触发压缩
+        static constexpr size_t MAX_SEGMENT_SIZE = 50000;      // 最大段大小（压缩前点数）
 
-        
-        // ---------- 阶段二扩展（压缩支持）----------
+        // 并发控制（如果需要）
+        mutable std::shared_mutex rw_mutex_;
 
-        // 这些成员将在阶段二实现时启用
-        // std::vector<int64_t> encoded_timestamps_; // 压缩后的时间戳（差分编码）
-        // std::vector<double> encoded_prices_;      // 压缩后的价格
-        // bool is_compressed_;                       // 是否已压缩
 
         // ---------- 阶段三扩展（内存池）----------
 
@@ -83,15 +100,13 @@ namespace high_frequency_storage {
 		// --查询数据时，由调用者保证读锁占用！
 		// --查询数据时，由被调用者写锁占用（如果需要排序或更新统计信息）！
 
-
         /**
          * @brief 添加一个价格数据点
          * @param timestamp 时间戳
          * @param price 价格
          * @throws std::invalid_argument 如果 timestamp 或 price 无效
          *
-         * 注意：调用者应保证 timestamp 大致递增，但本方法不强制。
-         * 添加后 time_sorted_ 可能变为 false，查询前会重新排序。
+         * 注意：调用者应保证 timestamp 不严格递增！
          */
         void addPrice(int64_t timestamp, double price);
 
@@ -110,8 +125,6 @@ namespace high_frequency_storage {
          *
          * 如果 start_time > end_time，返回空列表。
          * 时间复杂度：阶段一为 O(n)，后续优化为 O(log n)
-         * 
-         * 
          */
         std::vector<double> queryRange(int64_t start_time, int64_t end_time) const;
 
@@ -122,15 +135,16 @@ namespace high_frequency_storage {
          */
         double getPriceAt(int64_t timestamp) const;
 
+        // @brief 获取所有数据（未压缩）
+		std::vector<PricePoint> get_all_data() const;
+
         // ---------- 数据维护接口 ----------
-
+        
         /**
-         * @brief 确保数据按时间戳排序
-         *
-         * 查询操作会自动调用此方法，通常不需要手动调用。
+         * @brief 强制压缩活跃缓冲区
          */
-        void ensureSorted();
-
+        void flush();
+        
         /**
          * @brief 清空所有数据
          */
@@ -146,55 +160,48 @@ namespace high_frequency_storage {
 
         // @brief 获取股票代码        
         const std::string& stockCode() const { return stock_code_; }
-		// @brief 获取所有数据点（只读）
-		const std::vector<PricePoint>& getMetadata() const { return metadata_; }
 
         // @brief 获取数据点数量
-        size_t size() const { return metadata_.size(); }
-
+        size_t size() const {
+            std::shared_lock lock(rw_mutex_);
+            return total_points_;
+        }
+        
         // @brief 判断是否为空 
-        bool empty() const { return metadata_.empty(); }
+        bool empty() const {
+            std::shared_lock lock(rw_mutex_);
+            return active_buffer_.empty() && compressed_segments_.empty();
+        }
 
         // @brief 获取最低价格         
-        double minPrice() const;
+        double minPrice() const {
+            std::shared_lock lock(rw_mutex_);
+            return min_price_;
+        }
 
         // @brief 获取最高价格
-        double maxPrice() const;
+        double maxPrice() const {
+            std::shared_lock lock(rw_mutex_);
+            return max_price_;
+        }
 
-        
         // @brief 获取最早时间戳 
-        int64_t minTimestamp() const;
+        int64_t minTimestamp() const {
+            std::shared_lock lock(rw_mutex_);
+            return min_timestamp_;
+        }
 
         // @brief 获取最晚时间戳        
-        int64_t maxTimestamp() const;
+        int64_t maxTimestamp() const {
+            std::shared_lock lock(rw_mutex_);
+            return max_timestamp_;
+        }
 
-       
         // @brief 获取价格范围（最高-最低）  
         double priceRange() const { return maxPrice() - minPrice(); }
 
         // @brief 获取时间跨度（毫秒）        
         int64_t timeSpan() const { return maxTimestamp() - minTimestamp(); }
-
-        // ---------- 压缩接口（阶段二）----------
-
-        /**
-         * @brief 对数据进行差分压缩
-         * @return 是否成功压缩
-         *
-         * 阶段二实现：将原始数据转换为差分编码格式，
-         * 可减少内存占用 50% 以上。
-         */
-         // bool compress();
-
-         /**
-          * @brief 解压数据（如果需要）
-          */
-          // bool decompress();
-
-          /**
-           * @brief 检查是否已压缩
-           */
-           // bool isCompressed() const { return is_compressed_; }
 
         // ---------- 序列化接口（可选）----------
 
@@ -219,24 +226,38 @@ namespace high_frequency_storage {
         // @brief 获取内存占用估算值（字节） 
         size_t memoryUsage() const;
 
+
+        // ---------- 内部数据结构访问（谨慎使用）----------
+
+        const std::vector<PricePoint> getActiveBuffer() const { return active_buffer_; }
+        const std::vector<CompressedSegment> getCompressedSegments() const { return compressed_segments_; }
+
     private:
         // ---------- 内部工具函数 ----------
 
-    
-        // @brief 更新统计信息缓存
-        void refreshStats() const;
+        // @brief 压缩活跃缓冲区
+        void compressActiveBuffer();
 
-        
+        /**
+         * @brief 解压指定段
+         * @param idx 段索引
+         * @return 解压后的价格点列表
+         */
+        std::vector<PricePoint> decompressSegment(size_t idx) const;
+
+        /**
+         * @brief 二分查找包含目标时间的段
+         * @return 段索引，-1表示不存在
+         */
+        int findSegment(int64_t timestamp) const;
+
+        /**
+         * @brief 在压缩段中查找时间范围
+         */
+        std::pair<size_t, size_t> findSegmentRange(int64_t start, int64_t end) const;
+
         // @brief 检查价格点是否有效
         bool isValidPricePoint(int64_t timestamp, double price) const;
-
-        
-        // @brief 二分查找第一个 >= target 的位置
-        size_t lowerBound(int64_t target) const;
-
-        
-        // @brief 二分查找第一个 > target 的位置
-        size_t upperBound(int64_t target) const;
     };
 
 } // namespace high_frequency_storage
