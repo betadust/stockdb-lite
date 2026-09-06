@@ -1,17 +1,10 @@
 /**
  * @file src/StockSeries.cpp
  * @author @betadust
- * @date [2026-02-21]
+ * @date [2026-09-06]
  *
  * @note 修改说明：
- * - 删除了 ensureSorted() 函数 - 不再需要排序
- * - 删除了 time_sorted_ 成员变量 - 数据永远有序
- * - addPrice() 增加了严格时间递增检查 - 保证数据有序
- * - addPrices() 增加了批量时间递增检查 - 保证批次有序
- * - queryRange() 简化，直接使用二分查找 - 不再需要 ensureSorted
- * - 删除refreshStats() 加入数据时维护状态 - 统计信息实时更新
- * - 新增数据压缩段功能
- * - getPriceAt 返回值修改为完全匹配的价格 - 不再返回最接近数据
+ * - addPrices() 增加了缺失的独占锁
 */
 
 #include "StockSeries.hpp"
@@ -40,10 +33,10 @@ namespace high_frequency_storage {
 		total_points_ = 0;
 	}
 
-	// @brief 添加一个价格数据点，无锁，调用者需保证写锁占用
+	// @brief 添加一个价格数据点
 	// @修改：增加了严格时间递增检查，删除了 time_sorted_ 相关逻辑
 	void StockSeries::addPrice(int64_t timestamp, double price) {
-		std::unique_lock lock(rw_mutex_);
+		std::unique_lock lock(rw_mutex_); //独占锁
 		// 验证数据有效性
 		if (!isValidPricePoint(timestamp, price)) {
 			throw std::invalid_argument("Invalid timestamp or price:\n timestamp = "
@@ -78,6 +71,8 @@ namespace high_frequency_storage {
 	// @brief 批量添加价格数据点
 	// @修改：增加了严格的批次内和批次间时间递增检查，删除了 time_sorted_ 相关逻辑
 	void StockSeries::addPrices(const std::vector<PricePoint>& points) {
+		// 独占锁呢？
+		std::unique_lock lock(rw_mutex_); //独占锁
 		if (points.empty()) return;
 		// 1. 先验证所有数据
 		for (const auto& point : points) {
